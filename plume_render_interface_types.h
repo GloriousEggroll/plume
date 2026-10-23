@@ -1305,6 +1305,11 @@ namespace plume {
         uint32_t inputElementsCount = 0;
         const RenderSpecConstant *specConstants = nullptr;
         uint32_t specConstantsCount = 0;
+
+        // Optional Vulkan executable diagnostics, disabled for ordinary pipelines.
+        // Caller must use a device with pipelineExecutableInfo actually enabled.
+        bool captureExecutableStatistics = false;
+        bool captureExecutableInternalRepresentations = false;
     };
 
     struct RenderRaytracingPipelineLibrarySymbol {
@@ -1621,6 +1626,14 @@ namespace plume {
         const RenderTexture *depthAttachment = nullptr;
         const RenderTextureView *depthAttachmentView = nullptr;
         bool depthAttachmentReadOnly = false;
+        // Preserve existing depth/stencil values through a genuinely read-only
+        // pass. Vulkan requires STORE_OP_NONE support; unlike LOAD_OP_NONE,
+        // LOAD must retain the values used by depth and stencil tests.
+        bool depthAttachmentPreserveReadOnly = false;
+        // Explicit raster extent for a framebuffer with no color/depth views.
+        // Default zero preserves attached-framebuffer extent inference.
+        uint32_t attachmentlessWidth = 0;
+        uint32_t attachmentlessHeight = 0;
 
         RenderFramebufferDesc() = default;
 
