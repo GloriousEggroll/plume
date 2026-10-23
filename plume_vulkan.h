@@ -10,6 +10,7 @@
 #include "plume_render_interface.h"
 
 #include <mutex>
+#include <array>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -143,6 +144,8 @@ namespace plume {
         std::string entryPointName;
         VulkanDevice *device = nullptr;
         RenderShaderFormat format = RenderShaderFormat::UNKNOWN;
+        // Conservative module-owned metadata; UINT32_MAX retains every set.
+        uint32_t declaredDescriptorSets = UINT32_MAX;
 
         VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
         ~VulkanShader() override;
@@ -263,10 +266,48 @@ namespace plume {
         void releaseImageViews();
     };
 
+    // Optional exact-description cache. Only explicitly opted-in callers use
+    // it; immutable pass owners never retain framebuffers, images or a device.
+    struct VulkanFramebufferRenderPass {
+        VkDevice device = VK_NULL_HANDLE;
+        VkRenderPass vk = VK_NULL_HANDLE;
+        explicit VulkanFramebufferRenderPass(VkDevice device) : device(device) {}
+        VulkanFramebufferRenderPass(const VulkanFramebufferRenderPass &) = delete;
+        VulkanFramebufferRenderPass &operator=(const VulkanFramebufferRenderPass &) = delete;
+        ~VulkanFramebufferRenderPass();
+    };
+
+    class VulkanFramebufferRenderPassCache {
+    public:
+        static constexpr uint32_t kMaximumEntries = 16;
+        struct Key {
+            std::array<uint32_t, 40> words{};
+            bool operator==(const Key &other) const { return words == other.words; }
+        };
+        struct Statistics {
+            uint64_t requests = 0, hits = 0, misses = 0, creations = 0;
+            uint64_t unsupported_bypasses = 0, capacity_bypasses = 0, create_failures = 0;
+            uint64_t cached_entries = 0, maximum_entries = kMaximumEntries;
+        };
+        explicit VulkanFramebufferRenderPassCache(VkDevice device) : device_(device) {}
+        static bool MakeKey(const VkRenderPassCreateInfo &info, Key &key);
+        // A null owner with VK_SUCCESS means original uncached allocation.
+        std::shared_ptr<const VulkanFramebufferRenderPass> Acquire(VkDevice device,
+            const VkRenderPassCreateInfo &info, VkResult &result);
+        Statistics statistics() const;
+    private:
+        struct Entry { Key key; std::shared_ptr<const VulkanFramebufferRenderPass> owner; };
+        VkDevice device_;
+        mutable std::mutex mutex_;
+        std::array<Entry, kMaximumEntries> entries_;
+        Statistics stats_;
+    };
+
     struct VulkanFramebuffer : RenderFramebuffer {
         VulkanDevice *device = nullptr;
         VkFramebuffer vk = VK_NULL_HANDLE;
         VkRenderPass renderPass = VK_NULL_HANDLE;
+        std::shared_ptr<const VulkanFramebufferRenderPass> renderPassOwner;
         std::vector<const VulkanTexture *> colorAttachments;
         const VulkanTexture *depthAttachment = nullptr;
         std::unique_ptr<VulkanTextureView> depthAttachmentView = nullptr;
@@ -274,7 +315,8 @@ namespace plume {
         uint32_t width = 0;
         uint32_t height = 0;
 
-        VulkanFramebuffer(VulkanDevice *device, const RenderFramebufferDesc &desc);
+        VulkanFramebuffer(VulkanDevice *device, const RenderFramebufferDesc &desc,
+            VulkanFramebufferRenderPassCache *renderPassCache = nullptr);
         ~VulkanFramebuffer() override;
         uint32_t getWidth() const override;
         uint32_t getHeight() const override;
@@ -416,6 +458,8 @@ namespace plume {
         VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties = {};
         std::unique_ptr<RenderBuffer> nullBuffer;
         bool loadStoreOpNoneSupported = false;
+        bool storeOpNoneSupported = false; // Core 1.3 or an enabled NONE extension.
+        bool hostQueryResetEnabled = false; // Actual enabled device feature, never physical support alone.
         bool nullDescriptorSupported = false;
 
         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);

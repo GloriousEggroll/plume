@@ -14,6 +14,7 @@
 #include <cmath>
 #include <climits>
 #include <unordered_map>
+#include <stdexcept>
 
 #if DLSS_ENABLED
 #   include "render/plume_dlss.h"
@@ -1498,8 +1499,18 @@ namespace plume {
         }
 
         uint32_t renderTargetCount = desc.renderTargetCount;
-        if (renderTargetCount == 0 && desc.depthTargetFormat != RenderFormat::UNKNOWN) {
+        if (renderTargetCount == 0) {
+            // Rasterization with fragment storage writes still needs a viewport
+            // and scissor when the subpass has no framebuffer attachments.
             renderTargetCount = 1;
+        }
+        if (desc.renderTargetCount == 0 && desc.depthTargetFormat == RenderFormat::UNKNOWN) {
+            const auto samples = uint32_t(desc.multisampling.sampleCount);
+            if (!samples || (samples & (samples - 1)) ||
+                !(device->physicalDeviceProperties.limits.framebufferNoAttachmentsSampleCounts & samples)) {
+                fprintf(stderr, "Attachmentless pipeline sample count is unsupported.\n");
+                return;
+            }
         }
 
         VkPipelineViewportStateCreateInfo viewportState = {};
@@ -1636,6 +1647,8 @@ namespace plume {
         const VulkanPipelineLayout *pipelineLayout = static_cast<const VulkanPipelineLayout *>(desc.pipelineLayout);
         VkGraphicsPipelineCreateInfo pipelineInfo = {};
         pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        if (desc.captureExecutableStatistics) pipelineInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+        if (desc.captureExecutableInternalRepresentations) pipelineInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
         pipelineInfo.pStages = stages.data();
         pipelineInfo.stageCount = uint32_t(stages.size());
         pipelineInfo.pVertexInputState = &vertexInput;
@@ -2516,13 +2529,108 @@ namespace plume {
         }
     }
 
+    VulkanFramebufferRenderPass::~VulkanFramebufferRenderPass() {
+        if (vk != VK_NULL_HANDLE) vkDestroyRenderPass(device, vk, nullptr);
+    }
+
+    bool VulkanFramebufferRenderPassCache::MakeKey(const VkRenderPassCreateInfo &info, Key &key) {
+        // This is precisely the ordinary PassTransfer framebuffer shape. New
+        // extensions, dependency/subpass forms and attachment topologies keep
+        // the original allocation path until independently reviewed.
+        if (info.sType != VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO || info.pNext || info.flags ||
+            !info.pAttachments || !info.attachmentCount || info.attachmentCount > 2 ||
+            info.subpassCount != 1 || !info.pSubpasses || info.dependencyCount || info.pDependencies) return false;
+        const auto &subpass = info.pSubpasses[0];
+        if (subpass.flags || subpass.pipelineBindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS ||
+            subpass.inputAttachmentCount || subpass.pInputAttachments || subpass.pResolveAttachments ||
+            subpass.preserveAttachmentCount || subpass.pPreserveAttachments || subpass.colorAttachmentCount > 1 ||
+            (subpass.colorAttachmentCount != 0) != (subpass.pColorAttachments != nullptr) ||
+            info.attachmentCount != subpass.colorAttachmentCount + uint32_t(subpass.pDepthStencilAttachment != nullptr)) return false;
+        if (subpass.colorAttachmentCount && subpass.pColorAttachments[0].attachment != 0) return false;
+        if (subpass.pDepthStencilAttachment &&
+            subpass.pDepthStencilAttachment->attachment != subpass.colorAttachmentCount) return false;
+        Key candidate;
+        uint32_t at = 0;
+        const auto put = [&](uint32_t value) { candidate.words[at++] = value; };
+        put(uint32_t(info.sType)); put(info.flags); put(info.attachmentCount);
+        put(info.subpassCount); put(info.dependencyCount);
+        for (uint32_t i = 0; i < info.attachmentCount; ++i) {
+            const auto &a = info.pAttachments[i];
+            put(a.flags); put(uint32_t(a.format)); put(uint32_t(a.samples));
+            put(uint32_t(a.loadOp)); put(uint32_t(a.storeOp));
+            put(uint32_t(a.stencilLoadOp)); put(uint32_t(a.stencilStoreOp));
+            put(uint32_t(a.initialLayout)); put(uint32_t(a.finalLayout));
+        }
+        put(subpass.flags); put(uint32_t(subpass.pipelineBindPoint));
+        put(subpass.inputAttachmentCount); put(subpass.colorAttachmentCount); put(subpass.preserveAttachmentCount);
+        if (subpass.colorAttachmentCount) {
+            put(subpass.pColorAttachments[0].attachment); put(uint32_t(subpass.pColorAttachments[0].layout));
+        }
+        put(uint32_t(subpass.pDepthStencilAttachment != nullptr));
+        if (subpass.pDepthStencilAttachment) {
+            put(subpass.pDepthStencilAttachment->attachment); put(uint32_t(subpass.pDepthStencilAttachment->layout));
+        }
+        // Pointer addresses and struct padding never enter this exact key.
+        key = candidate;
+        return true;
+    }
+
+    std::shared_ptr<const VulkanFramebufferRenderPass> VulkanFramebufferRenderPassCache::Acquire(
+            VkDevice device, const VkRenderPassCreateInfo &info, VkResult &result) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        result = VK_SUCCESS;
+        ++stats_.requests;
+        Key key;
+        if (!device || device != device_ || !MakeKey(info, key)) {
+            ++stats_.misses; ++stats_.unsupported_bypasses; return {};
+        }
+        for (uint32_t i = 0; i < stats_.cached_entries; ++i) {
+            if (entries_[i].key == key) { ++stats_.hits; return entries_[i].owner; }
+        }
+        ++stats_.misses;
+        if (stats_.cached_entries == kMaximumEntries) { ++stats_.capacity_bypasses; return {}; }
+        // Allocate ownership before creating a Vulkan handle. Only successful
+        // immutable objects enter the cache; failures never replay a command.
+        auto owner = std::make_shared<VulkanFramebufferRenderPass>(device);
+        result = vkCreateRenderPass(device, &info, nullptr, &owner->vk);
+        if (result != VK_SUCCESS) {
+            owner->vk = VK_NULL_HANDLE; ++stats_.create_failures; return {};
+        }
+        if (owner->vk == VK_NULL_HANDLE) {
+            result = VK_ERROR_INITIALIZATION_FAILED; ++stats_.create_failures; return {};
+        }
+        entries_[stats_.cached_entries++] = {key, owner};
+        ++stats_.creations;
+        return owner;
+    }
+
+    VulkanFramebufferRenderPassCache::Statistics VulkanFramebufferRenderPassCache::statistics() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stats_;
+    }
+
     // VulkanFramebuffer
     
-    VulkanFramebuffer::VulkanFramebuffer(VulkanDevice *device, const RenderFramebufferDesc &desc) {
+    VulkanFramebuffer::VulkanFramebuffer(VulkanDevice *device, const RenderFramebufferDesc &desc,
+            VulkanFramebufferRenderPassCache *renderPassCache) {
         assert(device != nullptr);
 
         this->device = device;
         depthAttachmentReadOnly = desc.depthAttachmentReadOnly;
+        if (!desc.colorAttachmentsCount && !desc.depthAttachment && !desc.depthAttachmentView) {
+            const auto &limits = device->physicalDeviceProperties.limits;
+            if (!desc.attachmentlessWidth || !desc.attachmentlessHeight ||
+                desc.attachmentlessWidth > limits.maxFramebufferWidth ||
+                desc.attachmentlessHeight > limits.maxFramebufferHeight || !limits.maxFramebufferLayers) {
+                fprintf(stderr, "Attachmentless framebuffer requires a valid explicit extent.\n");
+                return;
+            }
+            width = desc.attachmentlessWidth;
+            height = desc.attachmentlessHeight;
+        } else if (desc.attachmentlessWidth || desc.attachmentlessHeight) {
+            fprintf(stderr, "Attached framebuffer cannot specify an attachmentless extent.\n");
+            return;
+        }
 
         VkResult res;
         std::vector<VkAttachmentDescription> attachments;
@@ -2603,11 +2711,15 @@ namespace plume {
             // Upgrade the operations to NONE if supported. Fixes the following validation issue: https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/2349
             // We prefer to just ignore this potential hazard on older Vulkan versions as it just seems to be an edge case for some hardware.
             const bool preferNoneForReadOnly = desc.depthAttachmentReadOnly && device->loadStoreOpNoneSupported;
+            const bool preserveReadOnly = desc.depthAttachmentPreserveReadOnly;
+            if (preserveReadOnly && (!desc.depthAttachmentReadOnly || !device->storeOpNoneSupported)) {
+                throw std::invalid_argument("Preserved read-only depth requires read-only layout and enabled STORE_OP_NONE");
+            }
             VkAttachmentDescription attachment = {};
             attachment.format = toVk(depthAttachmentViewDesc.format);
             attachment.samples = VkSampleCountFlagBits(depthAttachment->desc.multisampling.sampleCount);
-            attachment.loadOp = preferNoneForReadOnly ? VK_ATTACHMENT_LOAD_OP_NONE_EXT : VK_ATTACHMENT_LOAD_OP_LOAD;
-            attachment.storeOp = preferNoneForReadOnly ? VK_ATTACHMENT_STORE_OP_NONE_EXT : VK_ATTACHMENT_STORE_OP_STORE;
+            attachment.loadOp = preferNoneForReadOnly && !preserveReadOnly ? VK_ATTACHMENT_LOAD_OP_NONE_EXT : VK_ATTACHMENT_LOAD_OP_LOAD;
+            attachment.storeOp = preferNoneForReadOnly || preserveReadOnly ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
             attachment.stencilLoadOp = attachment.loadOp;
             attachment.stencilStoreOp = attachment.storeOp;
             attachment.initialLayout = depthReference.layout;
@@ -2631,7 +2743,15 @@ namespace plume {
         passInfo.pSubpasses = &subpass;
         passInfo.subpassCount = 1;
 
-        res = vkCreateRenderPass(device->vk, &passInfo, nullptr, &renderPass);
+        if (renderPassCache) {
+            renderPassOwner = renderPassCache->Acquire(device->vk, passInfo, res);
+            if (res != VK_SUCCESS) {
+                fprintf(stderr, "Cached vkCreateRenderPass failed with error code 0x%X.\n", res);
+                return;
+            }
+            if (renderPassOwner) renderPass = renderPassOwner->vk;
+        }
+        res = renderPass != VK_NULL_HANDLE ? VK_SUCCESS : vkCreateRenderPass(device->vk, &passInfo, nullptr, &renderPass);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateRenderPass failed with error code 0x%X.\n", res);
             return;
@@ -2658,9 +2778,10 @@ namespace plume {
             vkDestroyFramebuffer(device->vk, vk, nullptr);
         }
 
-        if (renderPass != VK_NULL_HANDLE) {
+        if (renderPass != VK_NULL_HANDLE && !renderPassOwner) {
             vkDestroyRenderPass(device->vk, renderPass, nullptr);
         }
+        renderPassOwner.reset();
     }
 
     uint32_t VulkanFramebuffer::getWidth() const {
@@ -4181,6 +4302,8 @@ namespace plume {
 
         // Fill Vulkan-only capabilities.
         loadStoreOpNoneSupported = supportedOptionalExtensions.find(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME) != supportedOptionalExtensions.end();
+        storeOpNoneSupported = loadStoreOpNoneSupported ||
+            std::min(renderInterface->appInfo.apiVersion, physicalDeviceProperties.apiVersion) >= VK_API_VERSION_1_3;
 
         if (!nullDescriptorSupported) {
             nullBuffer = createBuffer(RenderBufferDesc::DefaultBuffer(16, RenderBufferFlag::VERTEX));
